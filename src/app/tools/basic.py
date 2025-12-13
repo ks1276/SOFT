@@ -3,32 +3,84 @@ from __future__ import annotations
 
 import datetime
 import math
+import os
 from typing import Optional
 
+import requests
 from pydantic import BaseModel, Field
 
 from src.app.tools.__base__ import tool
 
 
-# ---------- 1. 검색 툴 (더미 구현) ----------
+# ---------- 1. 검색 툴 (Google Custom Search JSON API) ----------
 
 class SearchInput(BaseModel):
     query: str = Field(..., description="사용자가 찾고 싶은 검색어")
-    top_k: int = Field(3, description="최대 몇 개의 결과를 반환할지")
+    top_k: int = Field(3, description="최대 몇 개의 결과를 반환할지 (1~10 권장)")
+    site: Optional[str] = Field(None, description="특정 도메인만 검색 (예: docs.python.org)")
 
 
 @tool(
     name="search",
-    description="간단한 더미 검색을 수행합니다. (지금은 실제 웹 검색이 아니라 예시 텍스트를 반환합니다.)",
+    description="Google Programmable Search Engine(CSE) 기반 웹 검색을 수행합니다.",
     input_model=SearchInput,
 )
 def search_tool(args: SearchInput) -> str:
     """
-    간단한 더미 검색 함수.
-    나중에 실제 웹 검색 API (예: SerpAPI, custom backend 등)로 교체하면 됨.
+    Google Custom Search JSON API를 호출해 검색 결과를 텍스트로 반환합니다.
+
+    환경변수(.env)
+    - GOOGLE_API_KEY: Google Cloud Console에서 발급한 API Key
+    - GOOGLE_CSE_ID: Programmable Search Engine의 Search engine ID (cx)
     """
-    # TODO: 나중에 실제 검색 API 연동
-    return f"[검색 결과 더미] '{args.query}' 에 대한 상위 {args.top_k}개 결과를 (추후 구현) 여기서 반환합니다."
+    api_key = os.getenv("GOOGLE_API_KEY")
+    cse_id = os.getenv("GOOGLE_CSE_ID")  # cx
+
+    if not api_key or not cse_id:
+        return (
+            "ERROR: GOOGLE_API_KEY 또는 GOOGLE_CSE_ID가 설정되지 않았습니다.\n"
+            "(.env에 GOOGLE_API_KEY=..., GOOGLE_CSE_ID=... 추가 후 재실행하세요.)"
+        )
+
+    num = max(1, min(int(args.top_k), 10))
+
+    url = "https://www.googleapis.com/customsearch/v1"
+    params = {
+        "key": api_key,
+        "cx": cse_id,
+        "q": args.query,
+        "num": num,
+    }
+    if args.site:
+        params["siteSearch"] = args.site
+
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        data = resp.json()
+    except requests.HTTPError as e:
+        # API가 에러 메시지를 JSON으로 주는 경우가 많아서 최대한 노출
+        try:
+            err = resp.json()
+        except Exception:
+            err = resp.text if "resp" in locals() else ""
+        return f"ERROR: 구글 검색 API HTTP 오류: {e}\n{err}"
+    except Exception as e:
+        return f"ERROR: 구글 검색 호출 실패: {e!r}"
+
+    items = data.get("items") or []
+    if not items:
+        return f"검색 결과 없음: {args.query}"
+
+    # 에이전트가 쓰기 좋게: 번호 + 제목 + 링크 + 요약
+    lines = [f"[Google Search] query='{args.query}' (top {num})"]
+    for i, it in enumerate(items, start=1):
+        title = (it.get("title") or "").strip()
+        link = (it.get("link") or "").strip()
+        snippet = (it.get("snippet") or "").strip()
+        lines.append(f"{i}. {title}\n   - {link}\n   - {snippet}")
+
+    return "\n".join(lines)
 
 
 # ---------- 2. 계산 툴 ----------
