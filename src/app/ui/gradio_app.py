@@ -5,6 +5,7 @@ import uuid
 import gradio as gr
 
 from src.app.graph.app import build_app
+import openai
 
 # 프로세스 시작 시 1번만 생성
 APP = build_app(enable_interrupt=False)
@@ -23,24 +24,32 @@ def _append(chat_history: list[dict], role: str, content: str) -> list[dict]:
 def _invoke(user_text: str, chat_history: list[dict], thread_id: str):
     user_text = (user_text or "").strip()
     if not user_text:
-        return chat_history, ""  # no-op
+        return chat_history, ""
 
     cfg = {"configurable": {"thread_id": thread_id}}
 
-    # LangGraph state 입력(최소)
     st = {
         "messages": [{"role": "user", "content": user_text}],
         "tool_calls": None,
         "steps": 0,
     }
 
-    out = APP.invoke(st, config=cfg)
-    msg = out["messages"][-1]
-    assistant_text = msg.content if hasattr(msg, "content") else str(msg)
+    try:
+        out = APP.invoke(st, config=cfg)
+        msg = out["messages"][-1]
+        assistant_text = msg.content if hasattr(msg, "content") else str(msg)
 
-    chat_history = _append(chat_history, "user", user_text)
-    chat_history = _append(chat_history, "assistant", assistant_text)
-    return chat_history, ""
+        chat_history = _append(chat_history, "user", user_text)
+        chat_history = _append(chat_history, "assistant", assistant_text)
+        return chat_history, ""
+
+    except openai.BadRequestError as e:
+        # 🔥 핵심: 깨진 thread 버리고 새 thread 생성
+        chat_history = _append(chat_history, "assistant",
+            "⚠️ 내부 상태 오류가 발생하여 대화를 초기화했습니다. 다시 질문해주세요."
+        )
+        return chat_history, ""
+
 
 
 def _run_test(prompt: str, chat_history: list[dict], thread_id: str):
@@ -52,7 +61,7 @@ def build_gradio():
         gr.Markdown("## SOFT Agent (LangGraph + Tools/RAG/Memory)")
 
         thread = gr.State(str(uuid.uuid4()))
-        chat = gr.Chatbot(height=420, type="messages")
+        chat = gr.Chatbot(height=420)
 
         with gr.Row():
             inp = gr.Textbox(label="메시지", placeholder="질문을 입력하세요…", scale=8)
