@@ -61,6 +61,10 @@ def _normalize_messages(messages: Any) -> List[Dict[str, Any]]:
         # 1) dict 그대로
         if isinstance(m, dict):
             if "role" in m:
+                # ✅ assistant tool_calls=[] 방지
+                if m.get("role") == "assistant" and isinstance(m.get("tool_calls"), list) and len(m["tool_calls"]) == 0:
+                    m = dict(m)
+                    m.pop("tool_calls", None)
                 out.append(m)
             else:
                 out.append({"role": "user", "content": str(m)})
@@ -72,20 +76,26 @@ def _normalize_messages(messages: Any) -> List[Dict[str, Any]]:
             t = d.get("type") or d.get("role")
             if t == "human":
                 out.append({"role": "user", "content": d.get("content", "")})
+
             elif t == "ai":
                 msg: Dict[str, Any] = {"role": "assistant", "content": d.get("content", "")}
-                if d.get("tool_calls") is not None:
-                    msg["tool_calls"] = d.get("tool_calls")
+
+                # ✅ 핵심: tool_calls가 "빈 리스트([])면 넣지 않는다"
+                tool_calls = d.get("tool_calls")
+                if tool_calls:
+                    msg["tool_calls"] = tool_calls
+
                 out.append(msg)
+
             elif t == "tool":
-                msg: Dict[str, Any] = {"role": "tool", "content": d.get("content", "")}
+                msg2: Dict[str, Any] = {"role": "tool", "content": d.get("content", "")}
                 if "tool_call_id" in d:
-                    msg["tool_call_id"] = d["tool_call_id"]
+                    msg2["tool_call_id"] = d["tool_call_id"]
                 if "name" in d:
-                    msg["name"] = d["name"]
-                out.append(msg)
+                    msg2["name"] = d["name"]
+                out.append(msg2)
+
             else:
-                # fallback
                 out.append({"role": "user", "content": str(d)})
             continue
 
@@ -150,6 +160,7 @@ def _sanitize_openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, 
     """
     OpenAI로 보내기 직전에 messages를 정리:
     - assistant.tool_calls 원소(dict/객체 섞임)를 전부 OpenAI 규격으로 변환
+    - ✅ tool_calls=[] 는 키 자체를 제거 (OpenAI 400 방지)
     """
     fixed: List[Dict[str, Any]] = []
     for m in messages:
@@ -158,16 +169,23 @@ def _sanitize_openai_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, 
 
         role = m.get("role")
         if role not in ("system", "user", "assistant", "tool"):
-            m = {"role": "user", "content": str(m)}
-            fixed.append(m)
+            fixed.append({"role": "user", "content": str(m)})
             continue
 
+        # ✅ 핵심: 빈 tool_calls는 삭제
+        if role == "assistant" and isinstance(m.get("tool_calls"), list) and len(m["tool_calls"]) == 0:
+            m = dict(m)
+            m.pop("tool_calls", None)
+
+        # tool_calls가 있으면 규격화
         if role == "assistant" and m.get("tool_calls"):
             tcs = m.get("tool_calls")
             if isinstance(tcs, list):
+                m = dict(m)
                 m["tool_calls"] = [_normalize_one_tool_call(tc) for tc in tcs]
 
         fixed.append(m)
+
     return fixed
 
 
@@ -175,7 +193,6 @@ def _to_message_dict(resp: Any) -> Dict[str, Any]:
     """
     chat_raw()의 반환값이 어떤 형태든 "assistant message dict"로 정규화.
     """
-    # dict인 경우
     if isinstance(resp, dict):
         if "choices" in resp and resp["choices"]:
             msg = resp["choices"][0].get("message")
@@ -185,7 +202,6 @@ def _to_message_dict(resp: Any) -> Dict[str, Any]:
             return resp
         return resp
 
-    # OpenAI/Pydantic 객체면 model_dump
     if hasattr(resp, "model_dump"):
         dumped = resp.model_dump()
         if isinstance(dumped, dict):
@@ -202,10 +218,7 @@ def _to_message_dict(resp: Any) -> Dict[str, Any]:
 # LangGraph nodes
 # -----------------------------
 def llm_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    # 1) 상태 메시지 정규화(객체/딕셔너리 섞여도 OK)
     messages = _normalize_messages(state.get("messages"))
-
-    # 2) OpenAI 규격으로 sanitize (tool_calls 강제 보정)
     messages = _sanitize_openai_messages(messages)
 
     tools = registry.list_openai_tools()
@@ -217,34 +230,30 @@ def llm_node(state: Dict[str, Any]) -> Dict[str, Any]:
     )
     msg = _to_message_dict(resp)
 
-    # (중요) 응답 assistant msg에 tool_calls가 있다면 이것도 규격화해서 state에 넣기
-    if isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("tool_calls"):
+    # 응답 assistant msg tool_calls 정규화 + ✅ 빈 tool_calls 제거
+    if isinstance(msg, dict) and msg.get("role") == "assistant":
         tcs = msg.get("tool_calls")
+
         if isinstance(tcs, list):
-            msg["tool_calls"] = [_normalize_one_tool_call(tc) for tc in tcs]
+            if len(tcs) == 0:
+                msg.pop("tool_calls", None)
+            else:
+                msg["tool_calls"] = [_normalize_one_tool_call(tc) for tc in tcs]
 
     out: Dict[str, Any] = {
         "messages": [msg],
-        "tool_calls": msg.get("tool_calls") or None,
+        "tool_calls": (msg.get("tool_calls") if isinstance(msg, dict) else None) or None,
+        "steps": int(state.get("steps", 0)) + 1,
     }
-
-    # 무한루프 방지용 step 카운터
-    out["steps"] = int(state.get("steps", 0)) + 1
     return out
 
 
 def tool_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    - llm_node가 만든 tool_calls를 실행
-    - 결과를 role="tool" 메시지로 messages에 append
-    - tool_calls는 처리했으니 None으로 비움
-    """
     tool_calls_any = state.get("tool_calls") or None
     if not tool_calls_any:
         return {"tool_calls": None}
 
     # tool_calls도 혹시 객체 섞였을 수 있으니 정규화
-    tool_calls: List[Dict[str, Any]] = []
     if isinstance(tool_calls_any, list):
         tool_calls = [_normalize_one_tool_call(tc) for tc in tool_calls_any]
     else:
