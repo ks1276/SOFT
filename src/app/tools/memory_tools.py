@@ -5,7 +5,8 @@ from typing import List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
-from src.app.memory.pipeline import read_memory, write_memory
+from src.app.memory.store import read_memory, write_memory
+
 from src.app.tools.__base__ import tool
 
 MemoryType = Literal["profile", "episodic", "knowledge"]
