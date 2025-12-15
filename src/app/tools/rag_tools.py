@@ -18,5 +18,8 @@ class RagQueryInput(BaseModel):
     input_model=RagQueryInput,
 )
 def rag_search_tool(args: RagQueryInput) -> str:
+    print("[RAG TOOL CALLED]", args.query)
     res = query_rag(args.query, args.top_k)
     return format_rag_answer(res)
+
+

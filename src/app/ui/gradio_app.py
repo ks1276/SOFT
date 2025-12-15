@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import uuid
 import gradio as gr
-
-from src.app.graph.app import build_app
 import openai
 
-# 프로세스 시작 시 1번만 생성
+from src.app.graph.app import build_app
+
+# -------------------------
+# LangGraph App (1회 생성)
+# -------------------------
 APP = build_app(enable_interrupt=False)
 
 TEST_1 = "123*987 계산해줘"
@@ -28,14 +30,14 @@ def _invoke(user_text: str, chat_history: list[dict], thread_id: str):
 
     cfg = {"configurable": {"thread_id": thread_id}}
 
-    st = {
+    state = {
         "messages": [{"role": "user", "content": user_text}],
         "tool_calls": None,
         "steps": 0,
     }
 
     try:
-        out = APP.invoke(st, config=cfg)
+        out = APP.invoke(state, config=cfg)
         msg = out["messages"][-1]
         assistant_text = msg.content if hasattr(msg, "content") else str(msg)
 
@@ -43,13 +45,13 @@ def _invoke(user_text: str, chat_history: list[dict], thread_id: str):
         chat_history = _append(chat_history, "assistant", assistant_text)
         return chat_history, ""
 
-    except openai.BadRequestError as e:
-        # 🔥 핵심: 깨진 thread 버리고 새 thread 생성
-        chat_history = _append(chat_history, "assistant",
-            "⚠️ 내부 상태 오류가 발생하여 대화를 초기화했습니다. 다시 질문해주세요."
+    except openai.BadRequestError:
+        chat_history = _append(
+            chat_history,
+            "assistant",
+            "⚠️ 내부 상태 오류가 발생하여 대화를 초기화했습니다. 다시 질문해주세요.",
         )
         return chat_history, ""
-
 
 
 def _run_test(prompt: str, chat_history: list[dict], thread_id: str):
@@ -58,7 +60,7 @@ def _run_test(prompt: str, chat_history: list[dict], thread_id: str):
 
 def build_gradio():
     with gr.Blocks() as demo:
-        gr.Markdown("## SOFT Agent (LangGraph + Tools/RAG/Memory)")
+        gr.Markdown("## SOFT Agent (LangGraph + Tools / RAG / Memory)")
 
         thread = gr.State(str(uuid.uuid4()))
         chat = gr.Chatbot(height=420)
@@ -75,24 +77,24 @@ def build_gradio():
         with gr.Row():
             reset = gr.Button("New Thread")
 
-        # 전송
+        # 입력
         btn.click(_invoke, inputs=[inp, chat, thread], outputs=[chat, inp])
         inp.submit(_invoke, inputs=[inp, chat, thread], outputs=[chat, inp])
 
-        # 테스트 버튼들
+        # 테스트 버튼
         t1.click(lambda h, tid: _run_test(TEST_1, h, tid), inputs=[chat, thread], outputs=[chat, inp])
         t2.click(lambda h, tid: _run_test(TEST_2, h, tid), inputs=[chat, thread], outputs=[chat, inp])
         t3.click(lambda h, tid: _run_test(TEST_3, h, tid), inputs=[chat, thread], outputs=[chat, inp])
 
-        # 새 대화(새 thread_id + chat 초기화)
+        # 새 스레드
         def new_thread():
             return [], str(uuid.uuid4())
 
         reset.click(new_thread, outputs=[chat, thread])
 
         gr.Markdown(
-            "- TEST 2가 동작하려면 RAG 인덱싱이 되어 있어야 합니다.\n"
-            "- thread_id를 유지해서 같은 대화를 이어갑니다."
+            "- TEST 2는 RAG 인덱싱이 필요합니다.\n"
+            "- thread_id를 유지하여 같은 대화를 이어갑니다."
         )
 
     return demo
