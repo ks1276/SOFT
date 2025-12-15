@@ -5,7 +5,6 @@ from typing import Any, Dict, List, Optional
 
 from src.app.llm.client import chat_raw
 from src.app.tools.__base__ import registry
-from src.app.graph.interrupt import raise_if_interrupted
 
 # ⚠️ 중요: @tool 데코레이터가 import 시점에 registry 등록을 수행하므로 반드시 import
 from src.app.tools import basic  # noqa: F401
@@ -170,11 +169,47 @@ def _to_message_dict(resp: Any) -> Dict[str, Any]:
 # =====================================================
 
 def llm_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    raise_if_interrupted(state)
-
+    # ===============================
+    # 1️⃣ messages 정규화
+    # ===============================
     messages = _normalize_messages(state.get("messages"))
+
+    # ===============================
+    # 🔥 Short-term memory 요약 트리거
+    # ===============================
+    last_user_msg = next(
+        (m["content"] for m in reversed(messages) if m.get("role") == "user"),
+        "",
+    )
+
+    SHORT_TERM_TRIGGERS = [
+        "지금까지 질문",
+        "이전 대화",
+        "대화 요약",
+        "방금 대화",
+        "내가 뭐 물어봤",
+    ]
+
+    if any(t in last_user_msg for t in SHORT_TERM_TRIGGERS):
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "다음은 사용자와의 최근 대화 기록이다. "
+                    "장기 메모리(Chroma)나 외부 지식을 사용하지 말고, "
+                    "아래 대화 기록만 기반으로 간단히 요약하라."
+                ),
+            }
+        ] + messages
+
+    # ===============================
+    # 2️⃣ OpenAI 메시지 sanitize
+    # ===============================
     messages = _sanitize_openai_messages(messages)
 
+    # ===============================
+    # 3️⃣ LLM 호출
+    # ===============================
     resp = chat_raw(
         messages=messages,
         tools=registry.list_openai_tools(),
@@ -182,22 +217,30 @@ def llm_node(state: Dict[str, Any]) -> Dict[str, Any]:
     )
     msg = _to_message_dict(resp)
 
+    # ===============================
+    # 4️⃣ tool_calls 처리 (기존 로직 유지)
+    # ===============================
     if msg.get("role") == "assistant" and isinstance(msg.get("tool_calls"), list):
         if not msg["tool_calls"]:
+            msg = dict(msg)
             msg.pop("tool_calls", None)
         else:
+            msg = dict(msg)
             msg["tool_calls"] = [_normalize_one_tool_call(tc) for tc in msg["tool_calls"]]
 
+    # ===============================
+    # 5️⃣ state 반환 (기존 그대로)
+    # ===============================
     return {
-        "messages": [msg],
-        "tool_calls": msg.get("tool_calls"),
+        "messages": [msg],                    # assistant 응답
+        "tool_calls": msg.get("tool_calls"),  # tool_node용
         "steps": int(state.get("steps", 0)) + 1,
     }
 
 
-def tool_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    raise_if_interrupted(state)
 
+
+def tool_node(state: Dict[str, Any]) -> Dict[str, Any]:
     tool_calls_any = state.get("tool_calls")
     if not tool_calls_any:
         return {"tool_calls": None}
@@ -232,13 +275,12 @@ def tool_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # =====================================================
 
 def memory_read_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    raise_if_interrupted(state)
-
     if state.get("memory_checked"):
         return {}
 
     from src.app.memory.store import read_memory
 
+    # ✅ 핵심: messages 정규화
     messages = _normalize_messages(state.get("messages", []))
 
     user_msg = next(
@@ -265,18 +307,24 @@ def memory_read_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    raise_if_interrupted(state)
-
-    # ✅ 1. 첫 턴에서는 reflection 하지 않음 (속도 개선 핵심)
-    if state.get("steps", 0) <= 1:
+    messages = state.get("messages", [])
+    if not messages:
         return {}
 
+    # reflection 생략 조건
+    if state.get("steps", 0) <= 1:
+        # 🔥 아무 것도 하지 말고 그대로 종료
+        return {
+            "messages": []   # add_messages → 기존 메시지 유지
+        }
     try:
+        # 지연 import (reflection 안 쓸 땐 비용 0)
         from src.app.memory.reflection import build_snippet, run_memory_extractor
         from src.app.memory.store import write_memory
         from src.app.config.settings import settings
         from langchain_openai import ChatOpenAI
     except Exception as e:
+        # 환경 문제로 reflection이 불가능해도 전체 그래프는 계속
         return {
             "messages": [{
                 "role": "system",
@@ -284,8 +332,10 @@ def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
             }]
         }
 
+    # ✅ 2. messages 정규화 (HumanMessage / dict 혼합 방지)
     messages = _normalize_messages(state.get("messages", []))
 
+    # 최근 user / assistant 발화 추출
     user_msg = next(
         (m["content"] for m in reversed(messages) if m.get("role") == "user"),
         "",
@@ -298,12 +348,14 @@ def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
     if not user_msg or not final_answer:
         return {}
 
+    # ✅ 3. extractor에 넘길 스니펫 구성
     snippet = build_snippet(
         history=messages,
         user_message=user_msg,
         final_answer=final_answer,
     )
 
+    # ✅ 4. Reflection 판단용 LLM (temperature 0 고정)
     llm = ChatOpenAI(
         model=settings.openai_model,
         temperature=0,
@@ -312,6 +364,7 @@ def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
     try:
         result = run_memory_extractor(llm, snippet)
     except Exception as e:
+        # reflection 판단 실패 → 조용히 skip
         return {
             "messages": [{
                 "role": "system",
@@ -319,9 +372,11 @@ def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
             }]
         }
 
+    # ✅ 5. 저장할 가치 없으면 종료
     if not result.get("should_write_memory"):
         return {}
 
+    # ✅ 6. Memory write
     try:
         write_memory(
             content=result["content"],
@@ -337,4 +392,5 @@ def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
             }]
         }
 
+    # reflection 자체는 사용자에게 직접 출력할 필요 없음
     return {}
