@@ -2,100 +2,147 @@
 from __future__ import annotations
 
 import uuid
-from typing import Generator, Tuple, List, Dict, Any
+from typing import Any, Dict, List
 
 import gradio as gr
-import openai
 
 from src.app.graph.app import build_app
-from src.app.graph.interrupt import GraphInterrupted, request_interrupt
 
-# -------------------------
-# LangGraph App (1회 생성)
-# -------------------------
-# ✅ Interrupt + Stream을 위해 enable_interrupt=True
-APP = build_app(enable_interrupt=True)
+APP = build_app(enable_interrupt=False)
 
 TEST_1 = "123*987 계산해줘"
 TEST_2 = "PDF에서 방금 넣은 문서 내용 요약해줘"
 TEST_3 = "사용자는 Gradio UI를 원함을 profile로 importance 4 tags ui로 저장해줘"
 
-
-def _append(chat_history: List[Dict[str, str]], role: str, content: str) -> List[Dict[str, str]]:
-    chat_history = chat_history or []
-    chat_history.append({"role": role, "content": content})
-    return chat_history
+# ✅ Gradio Chatbot이 요구하는 messages 포맷
+# history: [{"role":"user","content":"..."}, {"role":"assistant","content":"..."}, ...]
+ChatHistory = List[Dict[str, str]]
 
 
-def _interrupt(thread_id: str) -> None:
-    """⛔ Stop 버튼: 해당 thread_id 실행을 중단하도록 state에 플래그를 남김"""
+def _append(history: ChatHistory, role: str, content: str) -> ChatHistory:
+    history = history or []
+    history.append({"role": role, "content": content})
+    return history
+
+
+def _format_event_updates(ev: Any) -> str:
+    if not isinstance(ev, dict):
+        return str(ev)
+
+    parts: List[str] = []
+    for node_name, upd in ev.items():
+        if isinstance(upd, dict):
+            keys = ", ".join(upd.keys())
+            parts.append(f"[{node_name}] updated: {keys}")
+        else:
+            parts.append(f"[{node_name}] {upd}")
+    return " | ".join(parts)
+
+
+def _invoke_once(user_text: str, thread_id: str) -> str:
     cfg = {"configurable": {"thread_id": thread_id}}
-    APP.update_state(cfg, request_interrupt)
-
-
-def _invoke(user_text: str, chat_history: list, thread_id: str):
-    user_text = (user_text or "").strip()
-    if not user_text:
-        return chat_history, ""
-
-    cfg = {"configurable": {"thread_id": thread_id}}
-
     state = {
         "messages": [{"role": "user", "content": user_text}],
         "tool_calls": None,
         "steps": 0,
     }
+    out = APP.invoke(state, config=cfg)
+    m = out["messages"][-1]
+    return m.content if hasattr(m, "content") else str(m)
 
-    chat_history = chat_history or []
-    chat_history.append({"role": "user", "content": user_text})
 
+def _chat_send(
+    user_text: str,
+    history: ChatHistory,
+    thread_id: str,
+    use_stream: bool,
+    trace: str,
+):
+    """
+    ✅ 항상 generator(=항상 yield)
+    outputs = [chat, inp, trace_box] 이므로 항상 3개를 yield 해야 함.
+    """
+    user_text = (user_text or "").strip()
+    history = history or []
+    trace = trace or ""
+
+    if not user_text:
+        yield history, "", trace
+        return
+
+    # UI history에 user/assistant 슬롯을 먼저 만들어 둠 (갱신 보장)
+    history = _append(history, "user", user_text)
+    history = _append(history, "assistant", "…(처리 중)")
+    yield history, "", trace
+
+    if not use_stream:
+        try:
+            assistant_text = _invoke_once(user_text, thread_id)
+            history[-1] = {"role": "assistant", "content": assistant_text}
+            yield history, "", trace
+            return
+        except Exception as e:
+            history[-1] = {"role": "assistant", "content": f"⚠️ 오류: {type(e).__name__}: {e}"}
+            yield history, "", trace
+            return
+
+    # stream ON: LangGraph 노드 단위 진행 로그를 trace_box에 갱신
     try:
-        # ✅ 중요: END state만 받는다 (LangGraph가 tool 루프 보장)
-        out = APP.invoke(state, config=cfg)
+        cfg = {"configurable": {"thread_id": thread_id}}
+        state = {
+            "messages": [{"role": "user", "content": user_text}],
+            "tool_calls": None,
+            "steps": 0,
+        }
 
-        messages = out.get("messages", [])
-        last = messages[-1]
+        local_lines: List[str] = []
+        for ev in APP.stream(state, config=cfg, stream_mode="updates"):
+            local_lines.append(_format_event_updates(ev))
+            new_trace = (trace + "\n" + "\n".join(local_lines)).strip()
+            yield history, "", new_trace
 
-        # ✅ AIMessage / dict 둘 다 안전 처리
-        if hasattr(last, "content"):
-            content = last.content
-        elif isinstance(last, dict):
-            content = last.get("content", "")
-        else:
-            content = str(last)
-
-        chat_history.append({"role": "assistant", "content": content})
-        return chat_history, ""
-
-    except GraphInterrupted:
-        chat_history.append(
-            {"role": "assistant", "content": "⛔ 실행이 중단되었습니다."}
-        )
-        return chat_history, ""
+        # 최종 답변은 invoke 결과로 확정(토큰 스트리밍이 아니라 "노드 스트리밍"이므로)
+        assistant_text = _invoke_once(user_text, thread_id)
+        history[-1] = {"role": "assistant", "content": assistant_text}
+        final_trace = (trace + "\n" + "\n".join(local_lines)).strip()
+        yield history, "", final_trace
 
     except Exception as e:
-        chat_history.append(
-            {"role": "assistant", "content": f"⚠️ 오류: {e}"}
-        )
-        return chat_history, ""
+        history[-1] = {"role": "assistant", "content": f"⚠️ 오류: {type(e).__name__}: {e}"}
+        yield history, "", trace
 
 
+# ✅ TEST 버튼도 반드시 generator 함수로 직접 연결 (lambda 금지)
+def _test1(history: ChatHistory, thread_id: str, use_stream: bool, trace: str):
+    yield from _chat_send(TEST_1, history, thread_id, use_stream, trace)
 
-def _run_test(prompt: str, chat_history: List[Dict[str, str]], thread_id: str):
-    return _invoke(prompt, chat_history, thread_id)
+
+def _test2(history: ChatHistory, thread_id: str, use_stream: bool, trace: str):
+    yield from _chat_send(TEST_2, history, thread_id, use_stream, trace)
+
+
+def _test3(history: ChatHistory, thread_id: str, use_stream: bool, trace: str):
+    yield from _chat_send(TEST_3, history, thread_id, use_stream, trace)
 
 
 def build_gradio():
     with gr.Blocks() as demo:
-        gr.Markdown("## SOFT Agent (LangGraph + Tools / RAG / Memory / Interrupt / Stream)")
+        gr.Markdown("## SOFT Agent (LangGraph + Tools / RAG / Memory)")
 
         thread = gr.State(str(uuid.uuid4()))
-        chat = gr.Chatbot(height=420)
+
+        chat = gr.Chatbot(height=420)  # ✅ messages 포맷 반환으로 맞춤
+        use_stream = gr.Checkbox(value=False, label="LangGraph stream(노드 단위 진행 로그 보기)")
+        trace_box = gr.Textbox(
+            label="Stream Trace (노드별 업데이트)",
+            value="",
+            lines=10,
+            interactive=False,
+        )
 
         with gr.Row():
             inp = gr.Textbox(label="메시지", placeholder="질문을 입력하세요…", scale=8)
             btn = gr.Button("Send", scale=2)
-            stop = gr.Button("⛔ Stop", scale=2)
 
         with gr.Row():
             t1 = gr.Button("TEST 1: 계산기")
@@ -104,28 +151,36 @@ def build_gradio():
 
         with gr.Row():
             reset = gr.Button("New Thread")
+            clear_trace = gr.Button("Clear Trace")
 
-        btn.click(_invoke, inputs=[inp, chat, thread], outputs=[chat, inp])
-        inp.submit(_invoke, inputs=[inp, chat, thread], outputs=[chat, inp])
+        # Send / Enter
+        btn.click(
+            _chat_send,
+            inputs=[inp, chat, thread, use_stream, trace_box],
+            outputs=[chat, inp, trace_box],
+        )
+        inp.submit(
+            _chat_send,
+            inputs=[inp, chat, thread, use_stream, trace_box],
+            outputs=[chat, inp, trace_box],
+        )
 
-        stop.click(_interrupt, inputs=[thread], outputs=[])
+        # Tests (lambda 금지)
+        t1.click(_test1, inputs=[chat, thread, use_stream, trace_box], outputs=[chat, inp, trace_box])
+        t2.click(_test2, inputs=[chat, thread, use_stream, trace_box], outputs=[chat, inp, trace_box])
+        t3.click(_test3, inputs=[chat, thread, use_stream, trace_box], outputs=[chat, inp, trace_box])
 
-        # 테스트 버튼도 stream으로 실행
-        t1.click(lambda h, tid: _run_test(TEST_1, h, tid), inputs=[chat, thread], outputs=[chat, inp])
-        t2.click(lambda h, tid: _run_test(TEST_2, h, tid), inputs=[chat, thread], outputs=[chat, inp])
-        t3.click(lambda h, tid: _run_test(TEST_3, h, tid), inputs=[chat, thread], outputs=[chat, inp])
-
+        # New Thread: history/trace는 비우고 thread만 새로
         def new_thread():
-            return [], str(uuid.uuid4())
+            return [], str(uuid.uuid4()), ""
 
-        reset.click(new_thread, outputs=[chat, thread])
+        reset.click(new_thread, outputs=[chat, thread, trace_box])
+
+        clear_trace.click(lambda: "", outputs=[trace_box])
 
         gr.Markdown(
-            """\
-- TEST 2는 RAG 인덱싱이 필요합니다.
-- thread_id를 유지하여 같은 대화를 이어갑니다.
-- Stop 버튼은 현재 thread의 실행을 중단합니다.
-"""
+            "- TEST 2는 RAG 인덱싱이 되어 있어야 결과가 나옵니다.\n"
+            "- stream 체크 시, LangGraph stream_mode='updates' 기반 노드 진행 로그를 trace에 출력합니다."
         )
 
     return demo
