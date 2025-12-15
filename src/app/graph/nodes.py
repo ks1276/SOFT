@@ -169,9 +169,47 @@ def _to_message_dict(resp: Any) -> Dict[str, Any]:
 # =====================================================
 
 def llm_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    # ===============================
+    # 1️⃣ messages 정규화
+    # ===============================
     messages = _normalize_messages(state.get("messages"))
+
+    # ===============================
+    # 🔥 Short-term memory 요약 트리거
+    # ===============================
+    last_user_msg = next(
+        (m["content"] for m in reversed(messages) if m.get("role") == "user"),
+        "",
+    )
+
+    SHORT_TERM_TRIGGERS = [
+        "지금까지 질문",
+        "이전 대화",
+        "대화 요약",
+        "방금 대화",
+        "내가 뭐 물어봤",
+    ]
+
+    if any(t in last_user_msg for t in SHORT_TERM_TRIGGERS):
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "다음은 사용자와의 최근 대화 기록이다. "
+                    "장기 메모리(Chroma)나 외부 지식을 사용하지 말고, "
+                    "아래 대화 기록만 기반으로 간단히 요약하라."
+                ),
+            }
+        ] + messages
+
+    # ===============================
+    # 2️⃣ OpenAI 메시지 sanitize
+    # ===============================
     messages = _sanitize_openai_messages(messages)
 
+    # ===============================
+    # 3️⃣ LLM 호출
+    # ===============================
     resp = chat_raw(
         messages=messages,
         tools=registry.list_openai_tools(),
@@ -179,17 +217,27 @@ def llm_node(state: Dict[str, Any]) -> Dict[str, Any]:
     )
     msg = _to_message_dict(resp)
 
+    # ===============================
+    # 4️⃣ tool_calls 처리 (기존 로직 유지)
+    # ===============================
     if msg.get("role") == "assistant" and isinstance(msg.get("tool_calls"), list):
         if not msg["tool_calls"]:
+            msg = dict(msg)
             msg.pop("tool_calls", None)
         else:
+            msg = dict(msg)
             msg["tool_calls"] = [_normalize_one_tool_call(tc) for tc in msg["tool_calls"]]
 
+    # ===============================
+    # 5️⃣ state 반환 (기존 그대로)
+    # ===============================
     return {
-        "messages": [msg],
-        "tool_calls": msg.get("tool_calls"),
+        "messages": [msg],                    # assistant 응답
+        "tool_calls": msg.get("tool_calls"),  # tool_node용
         "steps": int(state.get("steps", 0)) + 1,
     }
+
+
 
 
 def tool_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -259,22 +307,16 @@ def memory_read_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    대화 종료 시점에서:
-    - 최근 대화를 요약
-    - 장기 메모리로 저장할 가치가 있는지 LLM으로 판단
-    - 필요하면 memory DB에 write
-
-    ⚠️ 설계 포인트
-    - 첫 턴(step <= 1)에서는 reflection 생략 (속도 + UX)
-    - state["messages"]는 반드시 정규화 후 사용
-    - reflection 실패가 전체 그래프를 깨지 않도록 방어
-    """
-
-    # ✅ 1. 첫 턴에서는 reflection 하지 않음 (속도 개선 핵심)
-    if state.get("steps", 0) <= 1:
+    messages = state.get("messages", [])
+    if not messages:
         return {}
 
+    # reflection 생략 조건
+    if state.get("steps", 0) <= 1:
+        # 🔥 아무 것도 하지 말고 그대로 종료
+        return {
+            "messages": []   # add_messages → 기존 메시지 유지
+        }
     try:
         # 지연 import (reflection 안 쓸 땐 비용 0)
         from src.app.memory.reflection import build_snippet, run_memory_extractor
@@ -352,4 +394,3 @@ def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
     # reflection 자체는 사용자에게 직접 출력할 필요 없음
     return {}
-
