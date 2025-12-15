@@ -10,3 +10,6 @@ class AgentState(TypedDict):
     tool_calls: Optional[List[Dict[str, Any]]]
 
     steps: int
+
+    memory_checked: bool
+    rag_checked: bool

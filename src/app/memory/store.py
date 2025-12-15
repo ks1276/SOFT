@@ -73,10 +73,17 @@ def get_mem_collection():
 
 
 def get_mem_embedder() -> SentenceTransformer:
+    """
+    ⚠️ 중요:
+    - SentenceTransformer는 meta tensor 상태에서 .to(device)를 호출하면 터질 수 있음
+    - 따라서 최초 생성 시 device를 'cpu'로 명시 고정
+    """
     global _mem_embedder
     if _mem_embedder is None:
-        # RAG와 동일한 멀티링구얼 임베더 재사용
-        _mem_embedder = SentenceTransformer(settings.rag_embedding_model_name)
+        _mem_embedder = SentenceTransformer(
+            settings.rag_embedding_model_name,
+            device="cpu",   # ✅ meta tensor 문제 해결 핵심
+        )
     return _mem_embedder
 
 
@@ -114,9 +121,6 @@ def write_memory(
     return mem_id
 
 
-
-
-
 def read_memory(query: str, top_k: int = 5) -> List[MemoryItem]:
     col = get_mem_collection()
     qemb = get_mem_embedder().encode([query], show_progress_bar=False).tolist()
@@ -133,7 +137,6 @@ def read_memory(query: str, top_k: int = 5) -> List[MemoryItem]:
 
     out: List[MemoryItem] = []
     for mem_id, doc, meta in zip(ids, docs, metas):
-        # tags는 JSON string으로 저장했으니 다시 list로 복원
         raw_tags = meta.get("tags", "[]") if isinstance(meta, dict) else "[]"
         try:
             parsed_tags = json.loads(raw_tags) if isinstance(raw_tags, str) else raw_tags
