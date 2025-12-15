@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from src.app.llm.client import chat_raw
 from src.app.tools.__base__ import registry
+from src.app.graph.interrupt import raise_if_interrupted
 
 # ⚠️ 중요: @tool 데코레이터가 import 시점에 registry 등록을 수행하므로 반드시 import
 from src.app.tools import basic  # noqa: F401
@@ -169,6 +170,8 @@ def _to_message_dict(resp: Any) -> Dict[str, Any]:
 # =====================================================
 
 def llm_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    raise_if_interrupted(state)
+
     messages = _normalize_messages(state.get("messages"))
     messages = _sanitize_openai_messages(messages)
 
@@ -193,6 +196,8 @@ def llm_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def tool_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    raise_if_interrupted(state)
+
     tool_calls_any = state.get("tool_calls")
     if not tool_calls_any:
         return {"tool_calls": None}
@@ -227,12 +232,13 @@ def tool_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # =====================================================
 
 def memory_read_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    raise_if_interrupted(state)
+
     if state.get("memory_checked"):
         return {}
 
     from src.app.memory.store import read_memory
 
-    # ✅ 핵심: messages 정규화
     messages = _normalize_messages(state.get("messages", []))
 
     user_msg = next(
@@ -259,30 +265,18 @@ def memory_read_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    대화 종료 시점에서:
-    - 최근 대화를 요약
-    - 장기 메모리로 저장할 가치가 있는지 LLM으로 판단
-    - 필요하면 memory DB에 write
-
-    ⚠️ 설계 포인트
-    - 첫 턴(step <= 1)에서는 reflection 생략 (속도 + UX)
-    - state["messages"]는 반드시 정규화 후 사용
-    - reflection 실패가 전체 그래프를 깨지 않도록 방어
-    """
+    raise_if_interrupted(state)
 
     # ✅ 1. 첫 턴에서는 reflection 하지 않음 (속도 개선 핵심)
     if state.get("steps", 0) <= 1:
         return {}
 
     try:
-        # 지연 import (reflection 안 쓸 땐 비용 0)
         from src.app.memory.reflection import build_snippet, run_memory_extractor
         from src.app.memory.store import write_memory
         from src.app.config.settings import settings
         from langchain_openai import ChatOpenAI
     except Exception as e:
-        # 환경 문제로 reflection이 불가능해도 전체 그래프는 계속
         return {
             "messages": [{
                 "role": "system",
@@ -290,10 +284,8 @@ def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
             }]
         }
 
-    # ✅ 2. messages 정규화 (HumanMessage / dict 혼합 방지)
     messages = _normalize_messages(state.get("messages", []))
 
-    # 최근 user / assistant 발화 추출
     user_msg = next(
         (m["content"] for m in reversed(messages) if m.get("role") == "user"),
         "",
@@ -306,14 +298,12 @@ def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
     if not user_msg or not final_answer:
         return {}
 
-    # ✅ 3. extractor에 넘길 스니펫 구성
     snippet = build_snippet(
         history=messages,
         user_message=user_msg,
         final_answer=final_answer,
     )
 
-    # ✅ 4. Reflection 판단용 LLM (temperature 0 고정)
     llm = ChatOpenAI(
         model=settings.openai_model,
         temperature=0,
@@ -322,7 +312,6 @@ def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
     try:
         result = run_memory_extractor(llm, snippet)
     except Exception as e:
-        # reflection 판단 실패 → 조용히 skip
         return {
             "messages": [{
                 "role": "system",
@@ -330,11 +319,9 @@ def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
             }]
         }
 
-    # ✅ 5. 저장할 가치 없으면 종료
     if not result.get("should_write_memory"):
         return {}
 
-    # ✅ 6. Memory write
     try:
         write_memory(
             content=result["content"],
@@ -350,6 +337,4 @@ def reflection_node(state: Dict[str, Any]) -> Dict[str, Any]:
             }]
         }
 
-    # reflection 자체는 사용자에게 직접 출력할 필요 없음
     return {}
-
